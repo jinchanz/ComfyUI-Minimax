@@ -8,7 +8,16 @@ import torch
 import numpy as np
 from PIL import Image
 import io
+from io import BytesIO
 from .logging import logger
+
+# 尝试导入 VideoFromFile，如果不可用则使用字符串 URL
+try:
+    from comfy_api.input_impl import VideoFromFile
+    VIDEO_FROM_FILE_AVAILABLE = True
+except ImportError:
+    VIDEO_FROM_FILE_AVAILABLE = False
+    logger.info("[MiniMax] VideoFromFile 不可用，将使用 URL 字符串返回视频")
 
 
 # MiniMax API 基础 URL
@@ -253,8 +262,47 @@ async def _async_get_video_download_url(session, file_id, api_key):
         return None
 
 
-def _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time):
-    """创建视频生成任务并轮询结果，最后获取下载 URL"""
+def _download_video(download_url, timeout=300):
+    """下载视频文件到 BytesIO"""
+    try:
+        logger.info(f"[MiniMax] 开始下载视频: {download_url}")
+        response = requests.get(download_url, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        video_data = BytesIO()
+        for chunk in response.iter_content(chunk_size=8192):
+            video_data.write(chunk)
+        
+        video_data.seek(0)
+        logger.info(f"[MiniMax] 视频下载完成，大小: {len(video_data.getvalue())} 字节")
+        return video_data
+        
+    except Exception as e:
+        error_msg = f"下载视频失败: {str(e)}"
+        logger.info(f"[MiniMax] {error_msg}")
+        return None
+
+
+async def _async_download_video(session, download_url, timeout=300):
+    """异步下载视频文件到 BytesIO"""
+    try:
+        logger.info(f"[MiniMax] 开始下载视频: {download_url}")
+        async with session.get(download_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+            response.raise_for_status()
+            video_data = BytesIO(await response.read())
+        
+        video_data.seek(0)
+        logger.info(f"[MiniMax] 视频下载完成，大小: {len(video_data.getvalue())} 字节")
+        return video_data
+        
+    except Exception as e:
+        error_msg = f"下载视频失败: {str(e)}"
+        logger.info(f"[MiniMax] {error_msg}")
+        return None
+
+
+def _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time, download_video=False):
+    """创建视频生成任务并轮询结果，最后获取下载 URL，可选择下载视频"""
     endpoint = f"{MINIMAX_API_BASE}/v1/video_generation"
     headers = {
         "Content-Type": "application/json",
@@ -278,14 +326,14 @@ def _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_t
         if status_code != 0:
             error_msg = base_resp.get("status_msg", "请求失败")
             logger.info(f"[MiniMax] 请求失败: {error_msg}")
-            return {"error": error_msg, "base_resp": base_resp}
+            return {"error": error_msg, "base_resp": base_resp}, None
         
         # 获取 task_id
         task_id = response_data.get("task_id", "")
         if not task_id:
             error_msg = "未获取到 task_id"
             logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg}
+            return {"error": error_msg}, None
         
         logger.info(f"[MiniMax] 获取到任务ID: {task_id}")
         
@@ -294,23 +342,23 @@ def _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_t
         
         # 检查是否有错误
         if "error" in task_result:
-            return task_result
+            return task_result, None
         
         # 检查任务状态
         if task_result.get("status") != "Success":
-            return task_result
+            return task_result, None
         
         # 获取 file_id
         file_id = task_result.get("file_id", "")
         if not file_id:
             error_msg = "未获取到 file_id"
             logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg, "task_result": task_result}
+            return {"error": error_msg, "task_result": task_result}, None
         
         # 获取下载 URL
         download_url = _get_video_download_url(file_id, api_key)
         if not download_url:
-            return {"error": "获取下载 URL 失败", "task_result": task_result, "file_id": file_id}
+            return {"error": "获取下载 URL 失败", "task_result": task_result, "file_id": file_id}, None
         
         # 返回完整结果
         result = {
@@ -321,21 +369,31 @@ def _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_t
             "task_result": task_result
         }
         
-        return result
+        # 如果需要下载视频
+        video_object = None
+        if download_video:
+            video_data = _download_video(download_url)
+            if video_data and VIDEO_FROM_FILE_AVAILABLE:
+                video_object = VideoFromFile(video_data)
+            elif video_data:
+                # 如果 VideoFromFile 不可用，返回 URL
+                video_object = download_url
+        
+        return result, video_object
         
     except requests.exceptions.RequestException as e:
         error_msg = f"API 请求失败: {str(e)}"
         logger.info(f"[MiniMax] {error_msg}")
-        return {"error": error_msg}
+        return {"error": error_msg}, None
         
     except Exception as e:
         error_msg = f"未知错误: {str(e)}"
         logger.info(f"[MiniMax] {error_msg}")
-        return {"error": error_msg}
+        return {"error": error_msg}, None
 
 
-async def _async_create_and_poll_video_task(session, request_data, api_key, poll_interval, max_wait_time):
-    """异步创建视频生成任务并轮询结果，最后获取下载 URL"""
+async def _async_create_and_poll_video_task(session, request_data, api_key, poll_interval, max_wait_time, download_video=False):
+    """异步创建视频生成任务并轮询结果，最后获取下载 URL，可选择下载视频"""
     endpoint = f"{MINIMAX_API_BASE}/v1/video_generation"
     headers = {
         "Content-Type": "application/json",
@@ -361,14 +419,14 @@ async def _async_create_and_poll_video_task(session, request_data, api_key, poll
         if status_code != 0:
             error_msg = base_resp.get("status_msg", "请求失败")
             logger.info(f"[MiniMax] 请求失败: {error_msg}")
-            return {"error": error_msg, "base_resp": base_resp}
+            return {"error": error_msg, "base_resp": base_resp}, None
         
         # 获取 task_id
         task_id = response_data.get("task_id", "")
         if not task_id:
             error_msg = "未获取到 task_id"
             logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg}
+            return {"error": error_msg}, None
         
         logger.info(f"[MiniMax] 获取到任务ID: {task_id}")
         
@@ -377,23 +435,23 @@ async def _async_create_and_poll_video_task(session, request_data, api_key, poll
         
         # 检查是否有错误
         if "error" in task_result:
-            return task_result
+            return task_result, None
         
         # 检查任务状态
         if task_result.get("status") != "Success":
-            return task_result
+            return task_result, None
         
         # 获取 file_id
         file_id = task_result.get("file_id", "")
         if not file_id:
             error_msg = "未获取到 file_id"
             logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg, "task_result": task_result}
+            return {"error": error_msg, "task_result": task_result}, None
         
         # 获取下载 URL
         download_url = await _async_get_video_download_url(session, file_id, api_key)
         if not download_url:
-            return {"error": "获取下载 URL 失败", "task_result": task_result, "file_id": file_id}
+            return {"error": "获取下载 URL 失败", "task_result": task_result, "file_id": file_id}, None
         
         # 返回完整结果
         result = {
@@ -404,12 +462,22 @@ async def _async_create_and_poll_video_task(session, request_data, api_key, poll
             "task_result": task_result
         }
         
-        return result
+        # 如果需要下载视频
+        video_object = None
+        if download_video:
+            video_data = await _async_download_video(session, download_url)
+            if video_data and VIDEO_FROM_FILE_AVAILABLE:
+                video_object = VideoFromFile(video_data)
+            elif video_data:
+                # 如果 VideoFromFile 不可用，返回 URL
+                video_object = download_url
+        
+        return result, video_object
         
     except Exception as e:
         error_msg = f"未知错误: {str(e)}"
         logger.info(f"[MiniMax] {error_msg}")
-        return {"error": error_msg}
+        return {"error": error_msg}, None
 
 
 # ==================== 节点类定义 ====================
@@ -419,6 +487,12 @@ class MiniMaxTextToVideo:
     
     @classmethod
     def INPUT_TYPES(s):
+        return_types = ["STRING"]
+        if VIDEO_FROM_FILE_AVAILABLE:
+            return_types.append("VIDEO")
+        else:
+            return_types.append("STRING")
+        
         return {
             "required": {
                 "api_key": ("STRING", {"default": ""}),
@@ -432,13 +506,14 @@ class MiniMaxTextToVideo:
                 "resolution": (["720P", "768P", "1080P"], {"default": "768P"}),
                 "callback_url": ("STRING", {"default": ""}),
                 "aigc_watermark": ("BOOLEAN", {"default": False}),
+                "download_video": ("BOOLEAN", {"default": False}),
                 "poll_interval": ("INT", {"default": 3, "min": 1, "max": 30}),
                 "max_wait_time": ("INT", {"default": 600, "min": 30, "max": 3600}),
             }
         }
     
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("response",)
+    RETURN_TYPES = ("STRING", "STRING" if not VIDEO_FROM_FILE_AVAILABLE else "VIDEO")
+    RETURN_NAMES = ("response", "video")
     
     FUNCTION = "run"
     
@@ -448,7 +523,7 @@ class MiniMaxTextToVideo:
     
     def run(self, api_key, model, prompt, prompt_optimizer=True, fast_pretreatment=False, 
             duration=6, resolution="768P", callback_url="", aigc_watermark=False,
-            poll_interval=3, max_wait_time=600):
+            download_video=False, poll_interval=3, max_wait_time=600):
         try:
             if not prompt or prompt.strip() == "":
                 raise ValueError("prompt 不能为空")
@@ -468,14 +543,23 @@ class MiniMaxTextToVideo:
                 request_data["callback_url"] = callback_url
             
             # 创建任务并轮询
-            result = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time)
+            result, video_object = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time, download_video)
             
-            return (json.dumps(result, ensure_ascii=False, indent=2),)
+            # 返回 JSON 响应和视频对象
+            response_json = json.dumps(result, ensure_ascii=False, indent=2)
+            if video_object is None:
+                # 如果没有视频对象，返回 download_url 或空字符串
+                video_output = result.get("download_url", "") if "error" not in result else ""
+            else:
+                video_output = video_object
+            
+            return (response_json, video_output)
             
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
             logger.info(f"[MiniMax TextToVideo] {error_msg}")
-            return (json.dumps({"error": error_msg}, ensure_ascii=False),)
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False)
+            return (error_json, "")
 
 
 class MiniMaxImageToVideo:
@@ -498,13 +582,14 @@ class MiniMaxImageToVideo:
                 "resolution": (["512P", "720P", "768P", "1080P"], {"default": "768P"}),
                 "callback_url": ("STRING", {"default": ""}),
                 "aigc_watermark": ("BOOLEAN", {"default": False}),
+                "download_video": ("BOOLEAN", {"default": False}),
                 "poll_interval": ("INT", {"default": 3, "min": 1, "max": 30}),
                 "max_wait_time": ("INT", {"default": 600, "min": 30, "max": 3600}),
             }
         }
     
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("response",)
+    RETURN_TYPES = ("STRING", "STRING" if not VIDEO_FROM_FILE_AVAILABLE else "VIDEO")
+    RETURN_NAMES = ("response", "video")
     
     FUNCTION = "run"
     
@@ -514,7 +599,7 @@ class MiniMaxImageToVideo:
     
     def run(self, api_key, model, first_frame_image=None, first_frame_image_url="", prompt="", prompt_optimizer=True, 
             fast_pretreatment=False, duration=6, resolution="768P", callback_url="", 
-            aigc_watermark=False, poll_interval=3, max_wait_time=600):
+            aigc_watermark=False, download_video=False, poll_interval=3, max_wait_time=600):
         try:
             # 处理图片输入
             processed_image = _process_image_input(first_frame_image, first_frame_image_url)
@@ -539,14 +624,23 @@ class MiniMaxImageToVideo:
                 request_data["callback_url"] = callback_url
             
             # 创建任务并轮询
-            result = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time)
+            result, video_object = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time, download_video)
             
-            return (json.dumps(result, ensure_ascii=False, indent=2),)
+            # 返回 JSON 响应和视频对象
+            response_json = json.dumps(result, ensure_ascii=False, indent=2)
+            if video_object is None:
+                # 如果没有视频对象，返回 download_url 或空字符串
+                video_output = result.get("download_url", "") if "error" not in result else ""
+            else:
+                video_output = video_object
+            
+            return (response_json, video_output)
             
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
             logger.info(f"[MiniMax ImageToVideo] {error_msg}")
-            return (json.dumps({"error": error_msg}, ensure_ascii=False),)
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False)
+            return (error_json, "")
 
 
 class MiniMaxStartEndToVideo:
@@ -570,13 +664,14 @@ class MiniMaxStartEndToVideo:
                 "resolution": (["768P", "1080P"], {"default": "768P"}),
                 "callback_url": ("STRING", {"default": ""}),
                 "aigc_watermark": ("BOOLEAN", {"default": False}),
+                "download_video": ("BOOLEAN", {"default": False}),
                 "poll_interval": ("INT", {"default": 3, "min": 1, "max": 30}),
                 "max_wait_time": ("INT", {"default": 600, "min": 30, "max": 3600}),
             }
         }
     
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("response",)
+    RETURN_TYPES = ("STRING", "STRING" if not VIDEO_FROM_FILE_AVAILABLE else "VIDEO")
+    RETURN_NAMES = ("response", "video")
     
     FUNCTION = "run"
     
@@ -587,7 +682,7 @@ class MiniMaxStartEndToVideo:
     def run(self, api_key, model, first_frame_image=None, first_frame_image_url="", 
             last_frame_image=None, last_frame_image_url="", prompt="", 
             prompt_optimizer=True, duration=6, resolution="768P", callback_url="", 
-            aigc_watermark=False, poll_interval=3, max_wait_time=600):
+            aigc_watermark=False, download_video=False, poll_interval=3, max_wait_time=600):
         try:
             # 处理首帧图片输入
             processed_first_image = _process_image_input(first_frame_image, first_frame_image_url)
@@ -617,14 +712,23 @@ class MiniMaxStartEndToVideo:
                 request_data["callback_url"] = callback_url
             
             # 创建任务并轮询
-            result = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time)
+            result, video_object = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time, download_video)
             
-            return (json.dumps(result, ensure_ascii=False, indent=2),)
+            # 返回 JSON 响应和视频对象
+            response_json = json.dumps(result, ensure_ascii=False, indent=2)
+            if video_object is None:
+                # 如果没有视频对象，返回 download_url 或空字符串
+                video_output = result.get("download_url", "") if "error" not in result else ""
+            else:
+                video_output = video_object
+            
+            return (response_json, video_output)
             
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
             logger.info(f"[MiniMax StartEndToVideo] {error_msg}")
-            return (json.dumps({"error": error_msg}, ensure_ascii=False),)
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False)
+            return (error_json, "")
 
 
 class MiniMaxSubjectReferenceToVideo:
@@ -644,13 +748,14 @@ class MiniMaxSubjectReferenceToVideo:
                 "prompt_optimizer": ("BOOLEAN", {"default": True}),
                 "callback_url": ("STRING", {"default": ""}),
                 "aigc_watermark": ("BOOLEAN", {"default": False}),
+                "download_video": ("BOOLEAN", {"default": False}),
                 "poll_interval": ("INT", {"default": 3, "min": 1, "max": 30}),
                 "max_wait_time": ("INT", {"default": 600, "min": 30, "max": 3600}),
             }
         }
     
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("response",)
+    RETURN_TYPES = ("STRING", "STRING" if not VIDEO_FROM_FILE_AVAILABLE else "VIDEO")
+    RETURN_NAMES = ("response", "video")
     
     FUNCTION = "run"
     
@@ -659,7 +764,7 @@ class MiniMaxSubjectReferenceToVideo:
     CATEGORY = "MiniMax"
     
     def run(self, api_key, model, subject_image=None, subject_image_url="", prompt="", prompt_optimizer=True, 
-            callback_url="", aigc_watermark=False, poll_interval=3, max_wait_time=600):
+            callback_url="", aigc_watermark=False, download_video=False, poll_interval=3, max_wait_time=600):
         try:
             # 处理主体图片输入
             processed_image = _process_image_input(subject_image, subject_image_url)
@@ -686,14 +791,23 @@ class MiniMaxSubjectReferenceToVideo:
                 request_data["callback_url"] = callback_url
             
             # 创建任务并轮询
-            result = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time)
+            result, video_object = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time, download_video)
             
-            return (json.dumps(result, ensure_ascii=False, indent=2),)
+            # 返回 JSON 响应和视频对象
+            response_json = json.dumps(result, ensure_ascii=False, indent=2)
+            if video_object is None:
+                # 如果没有视频对象，返回 download_url 或空字符串
+                video_output = result.get("download_url", "") if "error" not in result else ""
+            else:
+                video_output = video_object
+            
+            return (response_json, video_output)
             
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
             logger.info(f"[MiniMax SubjectReferenceToVideo] {error_msg}")
-            return (json.dumps({"error": error_msg}, ensure_ascii=False),)
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False)
+            return (error_json, "")
 
 
 # 节点映射

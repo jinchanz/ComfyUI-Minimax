@@ -1,0 +1,11 @@
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+
+__pycache__/
+module/__pycache__/
