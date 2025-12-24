@@ -810,12 +810,186 @@ class MiniMaxSubjectReferenceToVideo:
             return (error_json, "")
 
 
+class MiniMaxSmartVideoGeneration:
+    """智能视频生成节点 - 根据输入自动选择生成模式"""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": ""}),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "optional": {
+                "image1": ("IMAGE",),
+                "image1_url": ("STRING", {"default": ""}),
+                "image2": ("IMAGE",),
+                "image2_url": ("STRING", {"default": ""}),
+                "subject_image_mode": ("BOOLEAN", {"default": False, "tooltip": "当只有一个图片时，True=主体参考生成，False=图生视频"}),
+                # 文生视频模型
+                "t2v_model": (["MiniMax-Hailuo-2.3", "MiniMax-Hailuo-02", "T2V-01-Director", "T2V-01"], {"default": "MiniMax-Hailuo-2.3"}),
+                # 图生视频模型
+                "i2v_model": (["MiniMax-Hailuo-2.3", "MiniMax-Hailuo-2.3-Fast", "MiniMax-Hailuo-02", "I2V-01-Director", "I2V-01-live", "I2V-01"], {"default": "MiniMax-Hailuo-2.3"}),
+                # 首尾帧模型
+                "startend_model": (["MiniMax-Hailuo-02"], {"default": "MiniMax-Hailuo-02"}),
+                # 主体参考模型
+                "subject_model": (["S2V-01"], {"default": "S2V-01"}),
+                # 通用参数
+                "prompt_optimizer": ("BOOLEAN", {"default": True}),
+                "fast_pretreatment": ("BOOLEAN", {"default": False}),
+                "duration": ("INT", {"default": 6, "min": 6, "max": 10}),
+                "resolution": (["512P", "720P", "768P", "1080P"], {"default": "768P"}),
+                "callback_url": ("STRING", {"default": ""}),
+                "aigc_watermark": ("BOOLEAN", {"default": False}),
+                "download_video": ("BOOLEAN", {"default": False}),
+                "poll_interval": ("INT", {"default": 3, "min": 1, "max": 30}),
+                "max_wait_time": ("INT", {"default": 600, "min": 30, "max": 3600}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING" if not VIDEO_FROM_FILE_AVAILABLE else "VIDEO", "STRING")
+    RETURN_NAMES = ("response", "video", "mode")
+    
+    FUNCTION = "run"
+    
+    OUTPUT_NODE = True
+    
+    CATEGORY = "MiniMax"
+    
+    def run(self, api_key, prompt, image1=None, image1_url="", image2=None, image2_url="", 
+            subject_image_mode=False, t2v_model="MiniMax-Hailuo-2.3", i2v_model="MiniMax-Hailuo-2.3",
+            startend_model="MiniMax-Hailuo-02", subject_model="S2V-01",
+            prompt_optimizer=True, fast_pretreatment=False, duration=6, resolution="768P",
+            callback_url="", aigc_watermark=False, download_video=False,
+            poll_interval=3, max_wait_time=600):
+        try:
+            # 检查图片输入
+            has_image1 = image1 is not None or (image1_url and image1_url.strip())
+            has_image2 = image2 is not None or (image2_url and image2_url.strip())
+            
+            # 确定生成模式
+            if not has_image1:
+                # 模式1: 文生视频
+                mode = "text_to_video"
+                logger.info(f"[MiniMax Smart] 检测到模式: {mode}")
+                
+                if not prompt or prompt.strip() == "":
+                    raise ValueError("文生视频模式需要提供 prompt")
+                
+                request_data = {
+                    "model": t2v_model,
+                    "prompt": prompt,
+                    "prompt_optimizer": prompt_optimizer,
+                    "fast_pretreatment": fast_pretreatment,
+                    "duration": duration,
+                    "resolution": resolution,
+                    "aigc_watermark": aigc_watermark
+                }
+                
+            elif has_image1 and not has_image2:
+                # 模式2: 单图片模式
+                processed_image1 = _process_image_input(image1, image1_url)
+                if not processed_image1:
+                    raise ValueError("image1 或 image1_url 必须提供其一")
+                
+                if subject_image_mode:
+                    # 模式2a: 主体参考生成视频
+                    mode = "subject_reference_to_video"
+                    logger.info(f"[MiniMax Smart] 检测到模式: {mode}")
+                    
+                    request_data = {
+                        "model": subject_model,
+                        "subject_reference": [
+                            {
+                                "type": "character",
+                                "image": [processed_image1]
+                            }
+                        ],
+                        "prompt_optimizer": prompt_optimizer,
+                        "aigc_watermark": aigc_watermark
+                    }
+                    
+                    # 主体参考生成视频不支持 duration、resolution、fast_pretreatment
+                    if prompt and prompt.strip():
+                        request_data["prompt"] = prompt
+                else:
+                    # 模式2b: 图生视频
+                    mode = "image_to_video"
+                    logger.info(f"[MiniMax Smart] 检测到模式: {mode}")
+                    
+                    request_data = {
+                        "model": i2v_model,
+                        "first_frame_image": processed_image1,
+                        "prompt_optimizer": prompt_optimizer,
+                        "fast_pretreatment": fast_pretreatment,
+                        "duration": duration,
+                        "resolution": resolution,
+                        "aigc_watermark": aigc_watermark
+                    }
+                    
+                    if prompt and prompt.strip():
+                        request_data["prompt"] = prompt
+            else:
+                # 模式3: 首尾帧生视频
+                mode = "start_end_to_video"
+                logger.info(f"[MiniMax Smart] 检测到模式: {mode}")
+                
+                processed_image1 = _process_image_input(image1, image1_url)
+                processed_image2 = _process_image_input(image2, image2_url)
+                
+                if not processed_image1:
+                    raise ValueError("image1 或 image1_url 必须提供")
+                if not processed_image2:
+                    raise ValueError("image2 或 image2_url 必须提供")
+                
+                request_data = {
+                    "model": startend_model,
+                    "first_frame_image": processed_image1,
+                    "last_frame_image": processed_image2,
+                    "prompt_optimizer": prompt_optimizer,
+                    "duration": duration,
+                    "resolution": resolution,
+                    "aigc_watermark": aigc_watermark
+                }
+                
+                if prompt and prompt.strip():
+                    request_data["prompt"] = prompt
+            
+            # 添加 callback_url
+            if callback_url and callback_url.strip():
+                request_data["callback_url"] = callback_url
+            
+            # 创建任务并轮询
+            result, video_object = _create_and_poll_video_task(request_data, api_key, poll_interval, max_wait_time, download_video)
+            
+            # 在结果中添加模式信息
+            if isinstance(result, dict) and "error" not in result:
+                result["generation_mode"] = mode
+            
+            # 返回 JSON 响应和视频对象
+            response_json = json.dumps(result, ensure_ascii=False, indent=2)
+            if video_object is None:
+                # 如果没有视频对象，返回 download_url 或空字符串
+                video_output = result.get("download_url", "") if isinstance(result, dict) and "error" not in result else ""
+            else:
+                video_output = video_object
+            
+            return (response_json, video_output, mode)
+            
+        except Exception as e:
+            error_msg = f"未知错误: {str(e)}"
+            logger.info(f"[MiniMax Smart] {error_msg}")
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False)
+            return (error_json, "", "error")
+
+
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "MiniMaxTextToVideo": MiniMaxTextToVideo,
     "MiniMaxImageToVideo": MiniMaxImageToVideo,
     "MiniMaxStartEndToVideo": MiniMaxStartEndToVideo,
     "MiniMaxSubjectReferenceToVideo": MiniMaxSubjectReferenceToVideo,
+    "MiniMaxSmartVideoGeneration": MiniMaxSmartVideoGeneration,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -823,5 +997,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxImageToVideo": "MiniMax Image to Video",
     "MiniMaxStartEndToVideo": "MiniMax Start-End to Video",
     "MiniMaxSubjectReferenceToVideo": "MiniMax Subject Reference to Video",
+    "MiniMaxSmartVideoGeneration": "MiniMax Smart Video Generation",
 }
 
