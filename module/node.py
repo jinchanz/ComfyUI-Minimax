@@ -145,13 +145,27 @@ def _poll_video_task(task_id, api_key, poll_interval, max_wait_time):
                 
         except requests.exceptions.RequestException as e:
             error_msg = f"轮询请求失败: {str(e)}"
-            logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg, "task_id": task_id}
+            logger.info(f"[MiniMax] {error_msg}，继续重试...")
+            # 检查是否超时
+            if time.time() - start_time > max_wait_time:
+                error_msg = f"任务轮询超时 ({max_wait_time}秒)，最后一次请求失败: {str(e)}"
+                logger.info(f"[MiniMax] {error_msg}")
+                return {"error": error_msg, "task_id": task_id}
+            # 等待后继续重试
+            time.sleep(poll_interval)
+            continue
             
         except Exception as e:
             error_msg = f"轮询过程出错: {str(e)}"
-            logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg, "task_id": task_id}
+            logger.info(f"[MiniMax] {error_msg}，继续重试...")
+            # 检查是否超时
+            if time.time() - start_time > max_wait_time:
+                error_msg = f"任务轮询超时 ({max_wait_time}秒)，最后一次请求出错: {str(e)}"
+                logger.info(f"[MiniMax] {error_msg}")
+                return {"error": error_msg, "task_id": task_id}
+            # 等待后继续重试
+            time.sleep(poll_interval)
+            continue
 
 
 async def _async_poll_video_task(session, task_id, api_key, poll_interval, max_wait_time):
@@ -204,8 +218,15 @@ async def _async_poll_video_task(session, task_id, api_key, poll_interval, max_w
                 
         except Exception as e:
             error_msg = f"轮询过程出错: {str(e)}"
-            logger.info(f"[MiniMax] {error_msg}")
-            return {"error": error_msg, "task_id": task_id}
+            logger.info(f"[MiniMax] {error_msg}，继续重试...")
+            # 检查是否超时
+            if time.time() - start_time > max_wait_time:
+                error_msg = f"任务轮询超时 ({max_wait_time}秒)，最后一次请求出错: {str(e)}"
+                logger.info(f"[MiniMax] {error_msg}")
+                return {"error": error_msg, "task_id": task_id}
+            # 等待后继续重试
+            await asyncio.sleep(poll_interval)
+            continue
 
 
 def _get_video_download_url(file_id, api_key):
